@@ -1,0 +1,25 @@
+# EchoPortal .gitignore
+
+# Build artifacts
+echoportal
+*.o
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*~
+
+# Distribution files
+*.tar.gz
+*.zip
