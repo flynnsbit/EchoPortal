@@ -114,6 +114,38 @@ This is a fully functional implementation of the EchoPortal music visualizer wit
 - **System Audio**: Ensure your music player outputs audio through your system's default PulseAudio device
 - **Monitor Setup**: Best experienced on high-refresh-rate displays in fullscreen
 
+## 🔧 Troubleshooting
+
+### Audio Issues with Specific Players
+
+**Omarchy (Wayland Music Player):**
+- **Issue**: EchoPortal may not capture audio from Omarchy
+- **Cause**: Okarchy's different audio routing (uses PipeWire/PulseAudio sinks)
+- **Solution**: EchoPortal automatically tries multiple audio sources - it should detect and work
+- **Verification**: Look for "Audio system initialized successfully using..." in console
+
+**Other Players:**
+If music reactivity doesn't work:
+1. Start playing music first
+2. Check console output - it shows which audio device is active
+3. Try restarting EchoPortal after starting music
+
+### Visual / Performance Issues
+
+**Low FPS or sluggish performance:**
+- Check that OpenGL 3.3 is supported: `glxinfo | grep "OpenGL"`
+- Verify hardware acceleration: `nvidia-smi` (if using NVIDIA)
+
+**Black screen (before debugging fixes):**
+- This was a bug in v1.0 - make sure you're using the latest version
+- The current version shows a purple background with test particles immediately
+
+**Console output explained:**
+```bash
+DEBUG: Frame 120 | Particles: 45 | Beat: 0.234 | Freq: 0.123 0.456 0.789 | Audio: 1
+        ^ Frame #    ^ Alive part  ^ Beat str  ^ Bass/Mid/High ^ Audio work
+```
+
 ## 🛠️ Development
 
 ### Project Structure
@@ -137,6 +169,13 @@ EchoPortal/
 - Customizable color schemes
 - Audio input device selection
 - Screenshot/movie recording features
+
+### Debug Mode
+Run with verbose console output for troubleshooting:
+```bash
+./echoportal  # Automatically shows debug info every second
+# Look for: Audio device detection, particle counts, frequency values
+```
 
 ---
 

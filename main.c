@@ -17,6 +17,7 @@
 // OpenGL and Graphics
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#include <GL/glu.h>
 
 // Audio Processing
 #include <pulse/simple.h>
@@ -41,6 +42,13 @@
 #define PARTICLE_LIFETIME 3.0f
 #define BASE_EMISSION_RATE 50.0f
 #define M_PI 3.14159265358979323846f
+
+// Performance constants - reduce rendering load for smoothness
+#define TARGET_FPS 60.0f
+#define FRAME_TIME (1.0f / TARGET_FPS)  // ~16.67ms per frame
+#define MAX_PARTICLES_VISIBLE 40  // Reduced for smoothness
+#define TUNNEL_SEGMENTS_LOW 12     // Reduced from 16
+#define TUNNEL_SECTIONS_LOW 8      // Reduced from 15
 
 // GLSL Shader Sources (embedded)
 const char* vertex_shader_source = "#version 330 core\n"
@@ -179,16 +187,18 @@ void process_audio();
 void detect_beat();
 void update_particles(float dt);
 void render();
+void draw_test_circle(float center_x, float center_y, float radius);
+void draw_digit(int digit, float x_offset);
 
 void cleanup();
 
-void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+void key_callback(GLFWwindow* window, int key, int scancode __attribute__((unused)), int action, int mods __attribute__((unused))) {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
         glfwSetWindowShouldClose(window, GL_TRUE);
     }
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc __attribute__((unused)), char* argv[] __attribute__((unused))) {
     // Initialize everything
     if (!init_glfw()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
@@ -217,10 +227,21 @@ int main(int argc, char* argv[]) {
 
     init_particles();
 
+    // Enable basic OpenGL settings
     glEnable(GL_POINT_SPRITE);
     glEnable(GL_PROGRAM_POINT_SIZE);
     glEnable(GL_DEPTH_TEST);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+
+    // Check for OpenGL errors
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        printf("OpenGL Error during init: %d\n", err);
+    }
+
+    printf("OpenGL initialization complete\n");
+    printf("GL版本: %s\n", glGetString(GL_VERSION));
+    printf("GLSL版本: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
 
     // Main loop
     while (!glfwWindowShouldClose(window)) {
@@ -235,10 +256,74 @@ int main(int argc, char* argv[]) {
         }
 
         update_particles(dt);
+
+        // Debug output every 60 frames (~60 FPS = once per second)
+        static int frame_count = 0;
+        frame_count++;
+        if (frame_count % 60 == 0) {
+            // Check raw audio sample for debugging
+            float sample_avg = 0.0f;
+            if (audio_device) {
+                for (int i = 0; i < 10 && i < AUDIO_BUFFER_SIZE; i++) {
+                    sample_avg += fabsf(audio_buffer[i]);
+                }
+                sample_avg /= 10.0f;
+            }
+
+            printf("DEBUG: Frame %d | Particles: %d | Beat: %.3f | Freq: %.3f %.3f %.3f | Audio: %d | SampleAvg: %.6f\n",
+                   frame_count, particle_count, beat_strength,
+                   freq_bands[0], freq_bands[1], freq_bands[2],
+                   audio_device ? 1 : 0, sample_avg);
+        }
+
         render();
 
+        // *** FRAME RATE LIMITING FOR SMOOTH 60 FPS ***
+        // Calculate elapsed frame time and enforce target FPS
+        double frame_end_time = glfwGetTime();
+        double frame_duration = frame_end_time - current_time;
+
+        // If frame completed faster than target, sleep to maintain FPS
+        if (frame_duration < FRAME_TIME) {
+            // Poll events briefly while waiting (non-blocking)
+            glfwPollEvents();
+
+            // Sleep remaining time to maintain frame rate
+            double sleep_time = FRAME_TIME - frame_duration;
+            static double last_fps_report = 0.0;
+
+            // Small busy-wait for precision timing (avoid system sleep granularity)
+            double busy_wait_start = glfwGetTime();
+            while (glfwGetTime() - busy_wait_start < sleep_time * 0.9) {
+                // Busy wait 90% of the time for precision
+            }
+
+            // Report FPS every 2 seconds
+            if (frame_end_time - last_fps_report > 2.0) {
+                printf("DEBUG: Target 60 FPS, Actual FPS: %.1f, Frame time: %.2f ms\n",
+                       1.0 / frame_duration, frame_duration * 1000.0);
+                last_fps_report = frame_end_time;
+            }
+
+            // Final poll to catch any pending events
+            glfwPollEvents();
+        }
+
+        // Swap buffers and poll events (blocking)
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        // Check for OpenGL errors periodically
+        static int error_check_counter = 0;
+        error_check_counter++;
+        if (error_check_counter % 300 == 0) {
+            GLenum err;
+            if ((err = glGetError()) != GL_NO_ERROR) {
+                printf("OpenGL Error in main loop: %d\n", err);
+            } else {
+                printf("DEBUG: No OpenGL errors in last 300 frames at target 60 FPS\n");
+            }
+        }
     }
 
     cleanup();
@@ -252,11 +337,21 @@ int init_glfw() {
         return 0;
     }
 
-    // Set Wayland hints
+    // Force OpenGL Compatibility Profile to support immediate mode calls for 3D rendering
     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    // Try compatibility profile first for legacy OpenGL calls (orbital camera, matrices)
+    #ifdef GLFW_OPENGL_COMPATIBILITY_PROFILE
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPATIBILITY_PROFILE);
+        printf("Forcing OpenGL Compatibility Profile for legacy support\n");
+    #else
+        // Fallback: Try setting to a compatibility value if the constant doesn't exist
+        printf("GLFW_OPENGL_COMPATIBILITY_PROFILE not available, trying fallback compatibility mode\n");
+        // Try setting to a known compatibility value
+        glfwWindowHint(GLFW_OPENGL_PROFILE, 0x00032002);  // Try OpenGL compatibility
+    #endif
 
     // Set fullscreen window hints
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
@@ -371,17 +466,55 @@ int init_audio() {
         .channels = 1  // Mono for visualization
     };
 
-    // Initialize PulseAudio device for monitoring system audio
-    // Use NULL for default sink to capture system-wide audio
-    audio_device = pa_simple_new(NULL, "EchoPortal", PA_STREAM_RECORD, NULL, "music", &ss, NULL, NULL, NULL);
+    printf("DEBUG: Initializing audio capture with intelligent device detection...\n");
 
-    if (!audio_device) {
-        fprintf(stderr, "Failed to initialize PulseAudio device\n");
-        fprintf(stderr, "Make sure PulseAudio is running and audio is available\n");
-        return 0;
+    // Array of devices to try in order of preference
+    const char* device_candidates[] = {
+        "alsa_output.pci-0000_00_1f.3.hdmi-stereo.monitor",  // HDMI monitor - most likely for Omarchy
+        NULL,  // Default device (NULL means auto-detect)
+        "alsa_output.pci-0000_00_1f.3.hdmi-stereo",          // HDMI sink (sometimes works)
+        "@DEFAULT_SINK@.monitor",                           // Special PulseAudio syntax
+        "default.monitor",                                  // Generic monitor device
+        "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor", // Analog output monitor (if available)
+    };
+
+    const char* device_names[] = {
+        "default device",  // NULL case
+        "HDMI output monitor",
+        "HDMI output sink",
+        "DEFAULT_SINK@ monitor",
+        "default.monitor",
+        "analog output monitor",
+    };
+
+    int num_candidates = sizeof(device_candidates) / sizeof(device_candidates[0]);
+
+    // Try each device candidate until one works
+    for (int i = 0; i < num_candidates; i++) {
+        printf("DEBUG: Trying audio device: %s\n", device_names[i]);
+
+        audio_device = pa_simple_new(NULL, "EchoPortal", PA_STREAM_RECORD,
+                                    device_candidates[i], "music", &ss, NULL, NULL, NULL);
+
+        if (audio_device) {
+            printf("DEBUG: Successfully opened audio device: %s\n",
+                   device_candidates[i] ? device_candidates[i] : "default");
+            printf("Audio system initialized successfully using %s\n", device_names[i]);
+            break; // Success! Keep this device
+        } else {
+            printf("DEBUG: Failed to open %s, trying next...\n", device_names[i]);
+        }
     }
 
-    // Allocate FFT memory
+    // If all devices failed
+    if (!audio_device) {
+        printf("WARNING: No audio device could be opened - music reactivity disabled\n");
+        printf("This is normal if no audio output is active. Try playing music first.\n");
+        printf("EchoPortal will still display the visual portal with test particles.\n");
+        // Note: We still allocate the buffers for potential later use
+    }
+
+    // Allocate audio processing buffers (even if audio fails, for future use)
     audio_buffer = (float*) calloc(AUDIO_BUFFER_SIZE, sizeof(float));
     if (!audio_buffer) {
         fprintf(stderr, "Failed to allocate audio buffer\n");
@@ -410,7 +543,10 @@ int init_audio() {
     // Seed random for particle spawning
     srand(time(NULL));
 
-    printf("Audio system initialized successfully\n");
+    printf("DEBUG: FFT and audio processing pipeline ready\n");
+    if (audio_device) {
+        printf("Music reactivity ENABLED - play audio to see portal effects!\n");
+    }
     return 1;
 }
 
@@ -482,6 +618,40 @@ int init_geometry() {
 void init_particles() {
     // Initialize particle array
     memset(particles, 0, sizeof(particles));
+
+    // DEBUG: Force some initial particles for testing
+    for (int i = 0; i < 10; i++) {  // Create 10 test particles
+        Particle* p = &particles[particle_count];
+
+        // Distribute test particles around portal
+        float angle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
+        float radius = 0.5f + ((float)rand() / RAND_MAX) * 1.5f;
+
+        p->pos.x = cosf(angle) * radius;
+        p->pos.y = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+        p->pos.z = sinf(angle) * radius;
+
+        // Small inward velocity for test movement
+        p->vel.x = -p->pos.x * 0.1f;
+        p->vel.y = 0.0f;
+        p->vel.z = -p->pos.z * 0.1f;
+
+        // Bright, visible test colors
+        if (i % 3 == 0) {
+            p->color.r = 1.0f; p->color.g = 0.2f; p->color.b = 0.2f; // Red
+        } else if (i % 3 == 1) {
+            p->color.r = 0.2f; p->color.g = 1.0f; p->color.b = 0.2f; // Green
+        } else {
+            p->color.r = 0.2f; p->color.g = 0.2f; p->color.b = 1.0f; // Blue
+        }
+        p->color.a = 1.0f;
+
+        p->size = 10.0f; // Large for easy visibility
+        p->life = 10.0f; // Long lifetime for debugging
+
+        particle_count++;
+    }
+    printf("DEBUG: Created %d test particles for visual verification\n", particle_count);
 }
 
 void process_audio() {
@@ -603,7 +773,7 @@ float clamp_float(float value, float min, float max) {
     return value;
 }
 
-void update_particles(float dt) {
+void update_particles(float dt __attribute__((unused))) {
     // Calculate emission rate based on audio data
     float base_emission = BASE_EMISSION_RATE;
     float beat_multiplier = 1.0f + beat_strength * 10.0f; // Up to 10x on strong beats
@@ -794,76 +964,6 @@ void mat4_look_at(float eyex, float eyey, float eyez,
     result[3] = 0.0f;      result[7] = 0.0f;      result[11] = 0.0f;      result[15] = 1.0f;
 }
 
-void render() {
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    // Get window dimensions for aspect ratio
-    int width, height;
-    glfwGetWindowSize(window, &width, &height);
-    float aspect = (float)width / (float)height;
-
-    // Setup matrices
-    float projection[16];
-    mat4_perspective(M_PI * 0.5f, aspect, 0.1f, 10.0f, projection);
-
-    float view[16];
-    // Orbital camera around portal
-    float camera_angle = (float)last_time * 0.2f; // Slow orbital motion
-    float camera_distance = 4.0f + beat_strength * 0.5f; // Pull closer on beats
-    float eyex = sinf(camera_angle) * camera_distance;
-    float eyez = cosf(camera_angle) * camera_distance;
-    float eyey = 0.5f;
-
-    mat4_look_at(eyex, eyey, eyez, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, view);
-
-    float model[16];
-    mat4_identity(model);
-
-    // Render vortex background first
-    glDisable(GL_DEPTH_TEST); // No depth for background
-    glUseProgram(vortexShader);
-
-    int timeLoc = glGetUniformLocation(vortexShader, "time");
-    glUniform1f(timeLoc, (float)last_time);
-
-    int energyLoc = glGetUniformLocation(vortexShader, "audio_energy");
-    glUniform1f(energyLoc, beat_energy);
-
-    glBindVertexArray(vortexVAO);
-    glDrawElements(GL_TRIANGLES, VORTEX_SEGMENTS * 6, GL_UNSIGNED_INT, 0);
-
-    // Enable depth testing for particles
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-
-    // Render particles
-    glUseProgram(particleShader);
-
-    int modelLoc = glGetUniformLocation(particleShader, "model");
-    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, model);
-
-    int viewLoc = glGetUniformLocation(particleShader, "view");
-    glUniformMatrix4fv(viewLoc, 1, GL_FALSE, view);
-
-    int projLoc = glGetUniformLocation(particleShader, "projection");
-    glUniformMatrix4fv(projLoc, 1, GL_FALSE, projection);
-
-    // Update particle VBO with current data
-    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(particles), particles);
-
-    // Draw particles
-    glBindVertexArray(particleVAO);
-    if (particle_count > 0) {
-        glDrawArrays(GL_POINTS, 0, particle_count);
-    }
-
-    // Reset state
-    glDisable(GL_BLEND);
-    glBindVertexArray(0);
-    glUseProgram(0);
-}
-
 void cleanup() {
     // Clean up audio resources
     if (audio_device) {
@@ -906,4 +1006,232 @@ void cleanup() {
     glfwTerminate();
 
     printf("Cleanup completed successfully\n");
+}
+
+void render() {
+    static int render_frame = 0;
+    render_frame++;
+
+    // Clear screen with audio-reactive background
+    float bg_brightness = beat_energy * 0.5f;
+    static float smoothed_bg = 0.0f;
+    smoothed_bg = smoothed_bg * 0.95f + bg_brightness * 0.05f;
+
+    float r = 0.1f + smoothed_bg * 0.3f;
+    float g = 0.05f;
+    float b = 0.15f + smoothed_bg * 0.2f;
+    glClearColor(r, g, b, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // *** KEEP WORKING AUDIO-REACTIVE BACKGROUND ***
+    glDisable(GL_DEPTH_TEST);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+
+    // *** WARP TUNNEL CYLINDER - SPEEDING THROUGH HYPERSPACE ***
+
+    // *** WARP TUNNEL CYLINDER - SPEEDING THROUGH HYPERSPACE ***
+
+    // Audio-responsive tunnel dynamics - OPTIMIZED FOR PERFORMANCE
+    const float tunnel_min_radius = 0.3f;  // Base tunnel radius
+    const float tunnel_max_radius = 1.0f; // Maximum expanded radius
+
+    // Tunnel constricts with bass energy (warps space)
+    float bass_constriction = freq_bands[0] * 3.0f; // Bass narrows tunnel
+    float tunnel_constriction = bass_constriction * bass_constriction; // Squared for dramatic effect
+    float base_radius = tunnel_min_radius + (tunnel_max_radius - tunnel_min_radius) * (1.0f - tunnel_constriction);
+
+    // Beat energy causes radial pulsations
+    float pulsation = beat_strength * 0.3f;
+
+    // Render the tunnel as connecting cylinder sections (creating "warp tunnel" effect) - PERFORMANCE OPTIMIZED
+    glColor4f(0.1f, 0.3f, 0.8f + freq_bands[2] * 0.4f, 0.8f); // Dynamic blue-purple energy
+
+    // Draw each tunnel section - REDUCED COUNT FOR PERFORMANCE
+    for (int section = 0; section <= TUNNEL_SECTIONS_LOW; section++) {
+        float z_offset = (float)section * 1.5f; // Spread sections along Z
+        float section_radius = base_radius + pulsation * (1.0f - (float)section / TUNNEL_SECTIONS_LOW);
+
+        // Add turbulence from beat energy
+        float turbulence = beat_energy * 0.2f * sinf(last_time * 3.0f + section * 0.3f);
+        section_radius += turbulence;
+
+        glBegin(GL_QUAD_STRIP);
+
+        // REDUCED CIRCUMFERENCE SEGMENTS FOR PERFORMANCE
+        for (int segment = 0; segment <= TUNNEL_SEGMENTS_LOW; segment++) {
+            float angle = (2.0f * M_PI * segment) / TUNNEL_SEGMENTS_LOW;
+
+            // Calculate tunnel wall position
+            float x = cosf(angle) * section_radius;
+            float y = sinf(angle) * section_radius;
+
+            // Draw quad strips connecting sections
+            glVertex3f(x, y, -z_offset);     // Current section
+            glVertex3f(x, y, -z_offset - 1.0f); // Next section
+        }
+        glEnd();
+    }
+
+    // *** PARTICLES SPEEDING THROUGH TUNNEL ***
+    glPointSize(3.0f);
+    glBegin(GL_POINTS);
+    glColor3f(1.0f, 0.8f, 0.6f); // Warm energy particles
+
+    // Spawn particles flowing through tunnel at different depths - PERFORMANCE LIMITED
+    for (int i = 0; i < particle_count && i < MAX_PARTICLES_VISIBLE; i++) {
+        Particle* p = &particles[i];
+        if (p->life > 0.0f) {
+            // Create "flowing through tunnel" effect
+            // Particles spiral along tunnel walls toward vanishing point
+            float tunnel_progress = fmodf(last_time * 2.0f + i * 0.1f, 10.0f);
+            float z_pos = p->pos.z - tunnel_progress * 2.0f; // Speed through tunnel
+
+            if (z_pos > -15.0f && z_pos < 1.0f) { // Only visible in tunnel range
+                // Spiral movement along tunnel walls
+                float spiral_angle = p->pos.x * 2.0f + fmodf(last_time * 4.0f + i * 0.5f, M_PI * 2);
+                float spiral_radius = tunnel_min_radius * 0.8f;
+
+                // Tunnel wall clinging motion
+                float x = cosf(spiral_angle) * spiral_radius;
+                float y = sinf(spiral_angle) * spiral_radius * 0.7f; // Slightly elliptical
+                float z = z_pos;
+
+                glVertex3f(x, y, z);
+            }
+        }
+    }
+    glEnd();
+
+    // *** CENTRAL PORTAL ENERGY CORE ***
+    glColor4f(1.0f, 0.5f + freq_bands[1] * 0.5f, freq_bands[2] * 2.0f, 0.9f);
+    glPointSize(15.0f + beat_strength * 25.0f); // Pulsing central nexus
+    glBegin(GL_POINTS);
+    glVertex3f(0.0f, 0.0f, -1.0f); // Central energy nexus
+    glEnd();
+
+    // *** TUNNEL ENTRANCE GLOW ***
+    // Radial energy emanating from portal entrance
+    glColor4f(0.8f, 0.6f, 1.0f, 0.6f);
+    glPointSize(8.0f);
+    glBegin(GL_POINTS);
+    for (int i = 0; i < 8; i++) {
+        float angle = (2.0f * M_PI * i) / 8.0f;
+        float distance = 0.5f + beat_energy * 0.8f;
+        float x = cosf(angle + last_time) * distance;
+        float y = sinf(angle + last_time) * distance * 0.8f;
+        glVertex3f(x, y, -0.5f);
+    }
+    glEnd();
+
+    // Debug frame counter
+    if (render_frame % 300 == 0) {
+        printf("DEBUG RENDER: Simple 3D Demo - Frame %d, Particles: %d, Beat: %.3f\n",
+               render_frame, particle_count, beat_strength);
+    }
+}
+
+// Helper function to draw a small test circle
+void draw_test_circle(float center_x, float center_y, float radius) {
+    const int segments = 16;
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(center_x, center_y); // Center point
+    for (int i = 0; i <= segments; i++) {
+        float angle = 2.0f * M_PI * (float)i / (float)segments;
+        float x = center_x + cosf(angle) * radius;
+        float y = center_y + sinf(angle) * radius;
+        glVertex2f(x, y);
+    }
+    glEnd();
+}
+
+// Helper function to draw simple digits (0-9) as pixels
+void draw_digit(int digit, float x_offset) {
+    const int digit_patterns[10][5][3] = {
+        // 0: XXX
+        // X  X
+        // X  X
+        // X  X
+        // XXX
+        {{1,1,1}, {1,0,1}, {1,0,1}, {1,0,1}, {1,1,1}},
+
+        // 1:  X
+        // XX
+        //  X
+        //  X
+        // XXX
+        {{0,0,1}, {0,1,1}, {0,0,1}, {0,0,1}, {0,1,1}},
+
+        // 2: XXX
+        //   X
+        // XXX
+        // X
+        // XXX
+        {{1,1,1}, {0,0,1}, {1,1,1}, {1,0,0}, {1,1,1}},
+
+        // 3: XXX
+        //   X
+        //  XX
+        //   X
+        // XXX
+        {{1,1,1}, {0,0,1}, {0,1,1}, {0,0,1}, {1,1,1}},
+
+        // 4: X X
+        // X X
+        // XXX
+        //   X
+        //   X
+        {{1,0,1}, {1,0,1}, {1,1,1}, {0,0,1}, {0,0,1}},
+
+        // 5: XXX
+        // X
+        // XXX
+        //   X
+        // XXX
+        {{1,1,1}, {1,0,0}, {1,1,1}, {0,0,1}, {1,1,1}},
+
+        // 6: XXX
+        // X
+        // XXX
+        // X X
+        // XXX
+        {{1,1,1}, {1,0,0}, {1,1,1}, {1,0,1}, {1,1,1}},
+
+        // 7: XXX
+        //   X
+        //  X
+        // X
+        // X
+        {{1,1,1}, {0,0,1}, {0,1,0}, {0,0,1}, {0,0,1}},
+
+        // 8: XXX
+        // X X
+        // XXX
+        // X X
+        // XXX
+        {{1,1,1}, {1,0,1}, {1,1,1}, {1,0,1}, {1,1,1}},
+
+        // 9: XXX
+        // X X
+        // XXX
+        //   X
+        // XXX
+        {{1,1,1}, {1,0,1}, {1,1,1}, {0,0,1}, {1,1,1}}
+    };
+
+    glPointSize(3.0f);
+    glBegin(GL_POINTS);
+    for (int y = 0; y < 5; y++) {
+        for (int x = 0; x < 3; x++) {
+            if (digit_patterns[digit][y][x]) {
+                float px = x_offset + (float)x * 0.008f;
+                float py = -0.90f + (float)y * 0.008f;
+                glVertex2f(px, py);
+            }
+        }
+    }
+    glEnd();
 }

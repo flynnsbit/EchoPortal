@@ -2,7 +2,7 @@
 
 CC = gcc
 CFLAGS = -std=c99 -O2 -Wall -Wextra
-LDFLAGS = -lglfw -lGLEW -lGL -lpulse-simple -lfftw3f -lm
+LDFLAGS = -lglfw -lGLEW -lGL -lGLU -lpulse-simple -lfftw3f -lm
 TARGET = echoportal
 SOURCES = main.c
 
